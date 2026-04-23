@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Async LLM agentic engine with tool execution, memory management, and dynamic skills"
 license = "MIT"
+repository = "https://github.com/paluigi/cascade-agent"
+keywords = ["llm", "agent", "ai", "cascade", "tools"]
+categories = ["asynchronous", "command-line-utilities"]
 
 [dependencies]
 # Async runtime
