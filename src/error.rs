@@ -35,6 +35,9 @@ pub enum AgentError {
     #[error("Toml error: {0}")]
     Toml(#[from] toml::de::Error),
 
+    #[error("Toml serialization error: {0}")]
+    TomlSer(#[from] toml::ser::Error),
+
     #[error("Embedding error: {0}")]
     EmbeddingError(String),
 

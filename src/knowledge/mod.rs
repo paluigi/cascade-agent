@@ -20,6 +20,7 @@ use vectordb::{KnowledgeEntry, SearchResult, VectorStore};
 // ---------------------------------------------------------------------------
 
 /// High-level knowledge base that combines embedding and vector storage.
+#[derive(Debug)]
 pub struct KnowledgeBase {
     store: VectorStore,
     config: KnowledgeSettings,

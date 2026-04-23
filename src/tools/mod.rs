@@ -2,6 +2,7 @@
 
 pub mod builtin;
 pub mod knowledge_tool;
+pub mod planning_tools;
 pub mod search;
 
 use async_trait::async_trait;

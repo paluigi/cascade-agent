@@ -108,9 +108,9 @@ mod tests {
 
     #[test]
     fn test_estimate_tokens() {
-        assert_eq!(estimate_tokens("hello"), 2); // 5 chars / 4 = 1, max(1) = 1... actually 5/4=1 in integer
-        assert_eq!(estimate_tokens("hello world this is a test"), 7);
-        assert!(estimate_tokens("") >= 1);
+        assert_eq!(estimate_tokens("hello"), 1); // 5 chars / 4 = 1
+        assert_eq!(estimate_tokens("hello world this is a test"), 6); // 27 chars / 4 = 6
+        assert!(estimate_tokens("") >= 1); // empty → max(1) = 1
     }
 
     #[test]
@@ -136,9 +136,9 @@ mod tests {
         ];
         let count = counter.count_messages(&msgs);
         // "You are helpful." = 16/4=4 + 2 (system) + 1 (sep) = 7
-        // "Hello!" = 6/4=2 + 2 (user) + 1 (sep) = 5
-        // "Hi there!" = 9/4=3 + 3 (assistant) + 1 (sep) = 7
-        // + 3 framing = 22
-        assert_eq!(count, 22);
+        // "Hello!" = 6/4=1 + 2 (user) + 1 (sep) = 4
+        // "Hi there!" = 9/4=2 + 3 (assistant) + 1 (sep) = 6
+        // + 3 framing = 20
+        assert_eq!(count, 20);
     }
 }

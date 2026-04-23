@@ -58,6 +58,16 @@ pub struct VectorStore {
     dim: usize,
 }
 
+impl std::fmt::Debug for VectorStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VectorStore")
+            .field("default_collection", &self.default_collection)
+            .field("dim", &self.dim)
+            .field("embedder", &self.embedder)
+            .finish_non_exhaustive()
+    }
+}
+
 impl VectorStore {
     /// Connect to (or create) a LanceDB database at `db_path`.
     pub async fn new(

@@ -5,6 +5,7 @@ pub mod websocket;
 use crate::config::OrchestratorSettings;
 use crate::error::Result;
 use async_trait::async_trait;
+use tokio::sync::broadcast;
 use types::OrchestratorMessage;
 
 /// Trait for bidirectional orchestrator communication.
@@ -29,11 +30,52 @@ impl OrchestratorConnection for NoopOrchestrator {
         tracing::debug!(target: "orchestrator", "Noop push: {:?}", message);
     }
     async fn recv(&mut self) -> Option<OrchestratorMessage> {
-        // Never receives anything — return None immediately
         std::future::pending().await
     }
     fn is_connected(&self) -> bool {
         false
+    }
+}
+
+/// Server-mode orchestrator: the agent hosts a WebSocket server and communicates
+/// via broadcast (outbound) and mpsc (inbound) channels.
+pub struct ServerOrchestrator {
+    broadcast_tx: broadcast::Sender<OrchestratorMessage>,
+    inbound_rx: tokio::sync::mpsc::Receiver<OrchestratorMessage>,
+    #[allow(dead_code)]
+    server_handle: Option<tokio::task::JoinHandle<crate::error::Result<()>>>,
+}
+
+impl std::fmt::Debug for ServerOrchestrator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerOrchestrator").finish()
+    }
+}
+
+impl ServerOrchestrator {
+    pub async fn new(bind_address: &str) -> Result<Self> {
+        let (server, broadcast_tx, inbound_rx) = server::OrchestratorServer::new(bind_address);
+        let handle = tokio::spawn(server.run());
+        Ok(Self {
+            broadcast_tx,
+            inbound_rx,
+            server_handle: Some(handle),
+        })
+    }
+}
+
+#[async_trait]
+impl OrchestratorConnection for ServerOrchestrator {
+    async fn push(&self, message: OrchestratorMessage) {
+        let _ = self.broadcast_tx.send(message);
+    }
+
+    async fn recv(&mut self) -> Option<OrchestratorMessage> {
+        self.inbound_rx.recv().await
+    }
+
+    fn is_connected(&self) -> bool {
+        self.broadcast_tx.receiver_count() > 0
     }
 }
 
@@ -45,12 +87,7 @@ pub fn create_orchestrator(
         return Ok(Box::new(NoopOrchestrator));
     }
     match config.transport.as_str() {
-        "websocket" => {
-            // Return a WebSocket orchestrator
-            // For now, return Noop — the WebSocket impl needs async init
-            // The actual creation will happen in AgentLoop::new() which is async
-            Ok(Box::new(NoopOrchestrator))
-        }
+        "websocket" => Ok(Box::new(NoopOrchestrator)),
         other => Err(crate::error::AgentError::OrchestratorError(format!(
             "Unknown transport: {}",
             other
@@ -67,13 +104,13 @@ pub async fn create_orchestrator_async(
     }
     match config.transport.as_str() {
         "websocket" => {
-            let url = config.connect_url.as_deref().ok_or_else(|| {
-                crate::error::AgentError::OrchestratorError(
-                    "WebSocket connect_url required when orchestrator enabled".into(),
-                )
-            })?;
-            let ws = websocket::WebSocketOrchestrator::connect(url).await?;
-            Ok(Box::new(ws))
+            if let Some(url) = &config.connect_url {
+                let ws = websocket::WebSocketOrchestrator::connect(url).await?;
+                Ok(Box::new(ws))
+            } else {
+                let server = ServerOrchestrator::new(&config.bind_address).await?;
+                Ok(Box::new(server))
+            }
         }
         other => Err(crate::error::AgentError::OrchestratorError(format!(
             "Unknown transport: {}",

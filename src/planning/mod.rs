@@ -2,8 +2,9 @@ pub mod types;
 
 use crate::error::Result;
 use std::path::{Path, PathBuf};
-use types::{Plan, PlanStatus, StepStatus};
+use types::{Plan, PlanData, PlanStatus, StepStatus};
 
+#[derive(Debug)]
 pub struct PlanManager {
     plans_dir: PathBuf,
 }
@@ -14,11 +15,10 @@ impl PlanManager {
         Ok(Self { plans_dir })
     }
 
-    /// Create a new plan, save it to disk, return it
     pub fn create_plan(&self, task_id: &str, title: &str, steps: Vec<String>) -> Result<Plan> {
         let mut plan = Plan::new(task_id, title, steps);
         let filename = format!(
-            "{}_{}.md",
+            "{}_{}.toml",
             plan.created_at.format("%Y%m%d_%H%M%S"),
             &plan.id[..8]
         );
@@ -27,31 +27,29 @@ impl PlanManager {
         Ok(plan)
     }
 
-    /// Save plan to markdown file
     pub fn save_plan(&self, plan: &Plan) -> Result<()> {
-        let content = self.render_markdown(plan);
+        let data = PlanData::from_plan(plan);
+        let content = toml::to_string_pretty(&data)?;
         std::fs::write(&plan.file_path, content)?;
         Ok(())
     }
 
-    /// Load a plan from its file path
     pub fn load_plan(&self, file_path: &Path) -> Result<Plan> {
         let content = std::fs::read_to_string(file_path)?;
-        self.parse_markdown(&content, file_path)
+        let data: PlanData = toml::from_str(&content)?;
+        data.to_plan(file_path)
     }
 
-    /// List all plan files in the plans directory
     pub fn list_plans(&self) -> Result<Vec<PathBuf>> {
         let mut plans: Vec<PathBuf> = std::fs::read_dir(&self.plans_dir)?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|ext| ext == "md"))
+            .filter(|p| p.extension().is_some_and(|ext| ext == "toml"))
             .collect();
         plans.sort();
         Ok(plans)
     }
 
-    /// Update a step's status and re-save
     pub fn update_step(
         &self,
         plan: &mut Plan,
@@ -59,21 +57,48 @@ impl PlanManager {
         status: StepStatus,
         result: Option<&str>,
     ) -> Result<()> {
-        if let Some(step) = plan.steps.iter_mut().find(|s| s.number == step_num) {
-            step.status = status;
-            step.result = result.map(String::from);
-            plan.updated_at = chrono::Utc::now();
-            self.save_plan(plan)?;
-            Ok(())
-        } else {
-            Err(crate::error::AgentError::ConfigError(format!(
-                "Step {} not found in plan",
-                step_num
-            )))
+        match status {
+            StepStatus::Completed => {
+                if !plan.mark_step_completed(step_num, result.map(String::from)) {
+                    return Err(crate::error::AgentError::ConfigError(format!(
+                        "Step {} not found in plan",
+                        step_num
+                    )));
+                }
+            }
+            StepStatus::Failed => {
+                if !plan.mark_step_failed(step_num, result.unwrap_or_default().to_string()) {
+                    return Err(crate::error::AgentError::ConfigError(format!(
+                        "Step {} not found in plan",
+                        step_num
+                    )));
+                }
+            }
+            StepStatus::InProgress => {
+                if !plan.mark_step_in_progress(step_num) {
+                    return Err(crate::error::AgentError::ConfigError(format!(
+                        "Step {} not found in plan",
+                        step_num
+                    )));
+                }
+            }
+            _ => {
+                if let Some(step) = plan.steps.iter_mut().find(|s| s.number == step_num) {
+                    step.status = status;
+                    step.result = result.map(String::from);
+                    plan.updated_at = chrono::Utc::now();
+                } else {
+                    return Err(crate::error::AgentError::ConfigError(format!(
+                        "Step {} not found in plan",
+                        step_num
+                    )));
+                }
+            }
         }
+        self.save_plan(plan)?;
+        Ok(())
     }
 
-    /// Render a Plan to markdown
     pub fn render_markdown(&self, plan: &Plan) -> String {
         let status_emoji = match &plan.status {
             PlanStatus::Draft => "📝",
@@ -93,6 +118,19 @@ impl PlanManager {
         };
 
         let mut md = format!("# {}\n\n", plan.title);
+
+        md.push_str(&format!("<!-- plan_id: {} -->\n", plan.id));
+        md.push_str(&format!("<!-- task_id: {} -->\n", plan.task_id));
+        md.push_str(&format!("<!-- plan_status: {:?} -->\n", plan.status));
+        md.push_str(&format!(
+            "<!-- created_at: {} -->\n",
+            plan.created_at.to_rfc3339()
+        ));
+        md.push_str(&format!(
+            "<!-- updated_at: {} -->\n",
+            plan.updated_at.to_rfc3339()
+        ));
+
         md.push_str(&format!("**Status:** {} {:?}\n", status_emoji, plan.status));
         md.push_str(&format!("**Task ID:** {}\n", plan.task_id));
         md.push_str(&format!("**Plan ID:** {}\n", plan.id));
@@ -103,6 +141,10 @@ impl PlanManager {
         md.push_str("---\n\n## Steps\n\n");
 
         for step in &plan.steps {
+            md.push_str(&format!(
+                "<!-- step_status_{}: {:?} -->\n",
+                step.number, step.status
+            ));
             md.push_str(&format!(
                 "{} **Step {}:** {}\n",
                 step_emoji(&step.status),
@@ -116,44 +158,5 @@ impl PlanManager {
         }
 
         md
-    }
-
-    /// Parse a plan from markdown (basic parser — reconstructs Plan from rendered markdown)
-    fn parse_markdown(&self, content: &str, file_path: &Path) -> Result<Plan> {
-        // Simple parser: extract title from first # heading, parse steps
-        let mut title = String::new();
-        let mut steps = Vec::new();
-        let mut step_num = 0;
-
-        for line in content.lines() {
-            if title.is_empty() && line.starts_with("# ") {
-                title = line[2..].trim().to_string();
-            } else if line.contains("Step ") && line.contains(':') {
-                step_num += 1;
-                if let Some(desc_start) = line.find(": ") {
-                    let desc = line[desc_start + 2..].trim().to_string();
-                    // Remove emoji prefix if present
-                    let desc = desc.trim_start_matches(|c: char| !c.is_alphanumeric() && c != '_');
-                    let desc = desc.trim_start_matches(|c: char| !c.is_alphanumeric());
-                    steps.push(types::PlanStep {
-                        number: step_num,
-                        description: desc.to_string(),
-                        status: StepStatus::Pending, // Lost in markdown serialization
-                        result: None,
-                    });
-                }
-            }
-        }
-
-        Ok(Plan {
-            id: uuid::Uuid::new_v4().to_string(), // Regenerate since not stored in markdown
-            task_id: String::new(),
-            title,
-            steps,
-            status: PlanStatus::Draft,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            file_path: file_path.to_path_buf(),
-        })
     }
 }

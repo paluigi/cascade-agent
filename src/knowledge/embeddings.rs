@@ -54,6 +54,14 @@ pub struct Embedder {
     dimension: usize,
 }
 
+impl std::fmt::Debug for Embedder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Embedder")
+            .field("dimension", &self.dimension)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Embedder {
     /// Create a new embedder, downloading the model if necessary.
     pub fn new(model_name: &str) -> Result<Self> {

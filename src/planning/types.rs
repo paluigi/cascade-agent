@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Plan {
@@ -11,7 +11,54 @@ pub struct Plan {
     pub status: PlanStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(skip)]
     pub file_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PlanData {
+    id: String,
+    task_id: String,
+    title: String,
+    status: PlanStatus,
+    created_at: String,
+    updated_at: String,
+    steps: Vec<PlanStep>,
+}
+
+impl PlanData {
+    pub(crate) fn from_plan(plan: &Plan) -> Self {
+        Self {
+            id: plan.id.clone(),
+            task_id: plan.task_id.clone(),
+            title: plan.title.clone(),
+            status: plan.status.clone(),
+            created_at: plan.created_at.to_rfc3339(),
+            updated_at: plan.updated_at.to_rfc3339(),
+            steps: plan.steps.clone(),
+        }
+    }
+
+    pub(crate) fn to_plan(&self, file_path: &Path) -> crate::error::Result<Plan> {
+        Ok(Plan {
+            id: self.id.clone(),
+            task_id: self.task_id.clone(),
+            title: self.title.clone(),
+            status: self.status.clone(),
+            created_at: DateTime::parse_from_rfc3339(&self.created_at)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|e| {
+                    crate::error::AgentError::ConfigError(format!("Invalid created_at: {}", e))
+                })?,
+            updated_at: DateTime::parse_from_rfc3339(&self.updated_at)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|e| {
+                    crate::error::AgentError::ConfigError(format!("Invalid updated_at: {}", e))
+                })?,
+            steps: self.steps.clone(),
+            file_path: file_path.to_path_buf(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,7 +79,7 @@ pub enum PlanStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Copy)]
 pub enum StepStatus {
     Pending,
     InProgress,

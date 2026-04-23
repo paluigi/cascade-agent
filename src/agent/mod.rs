@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 
 use crate::config::AgentConfig;
 use crate::error::{AgentError, Result};
+use crate::knowledge::KnowledgeBase;
 use crate::memory::MemoryManager;
 use crate::orchestrator::types::OrchestratorMessage;
 use crate::orchestrator::{create_orchestrator_async, OrchestratorConnection};
@@ -41,11 +42,13 @@ pub struct AgentLoop {
     #[allow(dead_code)]
     skill_manager: SkillManager,
     tool_registry: ToolRegistry,
+    #[allow(dead_code)]
+    knowledge: Option<Arc<KnowledgeBase>>,
     orchestrator: Box<dyn OrchestratorConnection>,
     interrupt_rx: mpsc::Receiver<UserInterrupt>,
     interrupt_tx: mpsc::Sender<UserInterrupt>,
     #[allow(dead_code)]
-    plan_manager: PlanManager,
+    plan_manager: Arc<std::sync::Mutex<PlanManager>>,
 }
 
 impl AgentLoop {
@@ -113,18 +116,58 @@ impl AgentLoop {
             ));
         }
 
-        // Register list_tools last (needs registry snapshot)
-        tool_registry.register_list_tools();
-
-        // Initialize orchestrator
-        let orchestrator = create_orchestrator_async(&config.orchestrator).await?;
-
         // Initialize plan manager
-        let plan_manager = PlanManager::new(std::path::PathBuf::from(&config.paths.plans_dir))?;
+        let plan_manager = Arc::new(std::sync::Mutex::new(PlanManager::new(
+            std::path::PathBuf::from(&config.paths.plans_dir),
+        )?));
 
         let (interrupt_tx, interrupt_rx) = mpsc::channel::<UserInterrupt>(32);
 
         let task_id = uuid::Uuid::new_v4().to_string();
+
+        // Register planning tools
+        tool_registry.register(crate::tools::planning_tools::CreatePlanTool::new(
+            Arc::clone(&plan_manager),
+            task_id.clone(),
+        ));
+        tool_registry.register(crate::tools::planning_tools::UpdatePlanStepTool::new(
+            Arc::clone(&plan_manager),
+        ));
+        tool_registry.register(crate::tools::planning_tools::ListPlansTool::new(
+            Arc::clone(&plan_manager),
+        ));
+        tool_registry.register(crate::tools::planning_tools::GetPlanTool::new(Arc::clone(
+            &plan_manager,
+        )));
+
+        // Register list_tools last (needs registry snapshot)
+        tool_registry.register_list_tools();
+
+        // Initialize knowledge base (may fail if ONNX Runtime is unavailable)
+        let knowledge = match KnowledgeBase::new(&config.knowledge).await {
+            Ok(kb) => {
+                tracing::info!(target: "agent", "Knowledge base initialized (collection: {})", config.knowledge.default_collection);
+                Some(Arc::new(kb))
+            }
+            Err(e) => {
+                tracing::warn!(target: "agent", "Knowledge base init failed, running without it: {}", e);
+                None
+            }
+        };
+
+        // Register knowledge query tool
+        if let Some(ref kb) = knowledge {
+            let kq_tool = crate::tools::knowledge_tool::KnowledgeQueryTool::with_defaults(
+                Arc::clone(kb) as Arc<dyn crate::tools::knowledge_tool::KnowledgeProvider>,
+                config.knowledge.default_collection.clone(),
+                config.knowledge.max_results,
+            );
+            tool_registry.register(kq_tool);
+        }
+
+        // Initialize orchestrator
+        let orchestrator = create_orchestrator_async(&config.orchestrator).await?;
+
         let state = ConversationState::new(system_prompt, task_id);
 
         Ok(Self {
@@ -135,6 +178,7 @@ impl AgentLoop {
             memory,
             skill_manager,
             tool_registry,
+            knowledge,
             orchestrator,
             interrupt_rx,
             interrupt_tx,
@@ -232,18 +276,28 @@ impl AgentLoop {
             let tool_defs = self.tool_registry.tool_definitions();
             let conversation = self.state.to_conversation().with_tools(tool_defs);
 
-            // 4. Send to llm-cascade (run_cascade is async, but takes &Connection which is sync)
+            // 4. Send to llm-cascade, while also listening for orchestrator messages
             let cascade_name = self.config.agent.cascade_name.clone();
             let config = Arc::clone(&self.cascade_config);
-            let conn_lock = self.db_conn.lock().await;
-            let response =
-                llm_cascade::run_cascade(&cascade_name, &conversation, &config, &conn_lock).await;
-            drop(conn_lock);
+
+            let cascade_future = async {
+                let conn_lock = self.db_conn.lock().await;
+                llm_cascade::run_cascade(&cascade_name, &conversation, &config, &conn_lock).await
+            };
+
+            let response = tokio::select! {
+                cascade_result = cascade_future => {
+                    cascade_result
+                }
+                Some(orch_msg) = self.orchestrator.recv() => {
+                    self.handle_orchestrator_message(orch_msg).await;
+                    continue;
+                }
+            };
 
             let response = match response {
                 Ok(r) => r,
                 Err(cascade_err) => {
-                    // Save state for recovery
                     let saved_path = self.state.to_json_file(&self.config.paths.outputs_dir)?;
                     tracing::error!(
                         target: "agent",
@@ -286,7 +340,11 @@ impl AgentLoop {
                             id
                         );
 
-                        let tool_result = self.tool_registry.execute(name, args).await;
+                        let tool_result = if name == "ask_user" {
+                            self.handle_ask_user(&args).await
+                        } else {
+                            self.tool_registry.execute(name, args.clone()).await
+                        };
                         let duration_ms = start.elapsed().as_millis() as u64;
 
                         let result_str = match &tool_result {
@@ -312,6 +370,13 @@ impl AgentLoop {
                                 duration_ms,
                             })
                             .await;
+
+                        // Auto-store search results in knowledge base
+                        if (name == "tavily_search" || name == "brave_search")
+                            && tool_result.is_ok()
+                        {
+                            self.store_search_results(name, &args, &tool_result).await;
+                        }
                     }
                 }
             }
@@ -332,6 +397,166 @@ impl AgentLoop {
         }
 
         Ok(self.state.last_assistant_text().unwrap_or_default())
+    }
+
+    /// Handle an inbound message from the orchestrator.
+    async fn handle_orchestrator_message(&mut self, msg: OrchestratorMessage) {
+        match msg {
+            OrchestratorMessage::UserReply { content } => {
+                self.state.add_user_message(content);
+            }
+            OrchestratorMessage::PlanApproval { approved, feedback } => {
+                let feedback_text = feedback.unwrap_or_default();
+                let approval_msg = if approved {
+                    format!("[Plan Approved] {}", feedback_text)
+                } else {
+                    format!("[Plan Rejected] {}", feedback_text)
+                };
+                self.state.add_user_message(approval_msg);
+            }
+            OrchestratorMessage::CancelTask => {
+                self.orchestrator
+                    .push(OrchestratorMessage::TaskCancelled)
+                    .await;
+            }
+            _ => {
+                tracing::debug!(target: "agent", "Ignoring orchestrator message: {:?}", msg);
+            }
+        }
+    }
+
+    /// Intercept ask_user tool calls: push question to orchestrator, await reply.
+    async fn handle_ask_user(
+        &mut self,
+        args: &serde_json::Value,
+    ) -> crate::error::Result<crate::tools::ToolResult> {
+        let question = args
+            .get("question")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(no question provided)");
+
+        if !self.orchestrator.is_connected() {
+            return Ok(crate::tools::ToolResult::ok(serde_json::json!({
+                "status": "no_orchestrator",
+                "question": question,
+                "answer": "No orchestrator connected. Use the interrupt channel to reply.",
+            })));
+        }
+
+        self.orchestrator
+            .push(OrchestratorMessage::UserQuestion {
+                question: question.to_string(),
+            })
+            .await;
+
+        tracing::info!(target: "agent", "Waiting for user reply to: {}", question);
+
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            self.orchestrator.recv(),
+        )
+        .await
+        {
+            Ok(Some(OrchestratorMessage::UserReply { content })) => {
+                Ok(crate::tools::ToolResult::ok(serde_json::json!({
+                    "status": "replied",
+                    "question": question,
+                    "answer": content,
+                })))
+            }
+            Ok(Some(other)) => {
+                self.handle_orchestrator_message(other).await;
+                Ok(crate::tools::ToolResult::ok(serde_json::json!({
+                    "status": "interrupted",
+                    "question": question,
+                    "answer": "User sent a different message instead of replying.",
+                })))
+            }
+            Ok(None) => Ok(crate::tools::ToolResult::ok(serde_json::json!({
+                "status": "timeout",
+                "question": question,
+                "answer": "Orchestrator disconnected before user replied.",
+            }))),
+            Err(_) => Ok(crate::tools::ToolResult::ok(serde_json::json!({
+                "status": "timeout",
+                "question": question,
+                "answer": "Timed out waiting for user reply (5 minutes).",
+            }))),
+        }
+    }
+
+    /// Store search results in the knowledge base for future retrieval.
+    async fn store_search_results(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        tool_result: &crate::error::Result<crate::tools::ToolResult>,
+    ) {
+        let kb = match &self.knowledge {
+            Some(kb) => kb,
+            None => return,
+        };
+
+        let query = match args.get("query").and_then(|v| v.as_str()) {
+            Some(q) => q.to_string(),
+            None => return,
+        };
+
+        let results = match tool_result {
+            Ok(r) => &r.data,
+            Err(_) => return,
+        };
+
+        let result_array = match results.get("results").and_then(|v| v.as_array()) {
+            Some(arr) => arr,
+            None => return,
+        };
+
+        let entries: Vec<crate::knowledge::vectordb::KnowledgeEntry> = result_array
+            .iter()
+            .filter_map(|item| {
+                let text = format!(
+                    "{}\n{}",
+                    item.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                    item.get("snippet").and_then(|v| v.as_str()).unwrap_or("")
+                );
+                if text.trim().is_empty() {
+                    return None;
+                }
+                Some(crate::knowledge::vectordb::KnowledgeEntry {
+                    text,
+                    source: tool_name.to_string(),
+                    metadata: serde_json::json!({
+                        "url": item.get("url").and_then(|v| v.as_str()).unwrap_or(""),
+                        "query": query,
+                    }),
+                    timestamp: chrono::Utc::now().timestamp(),
+                })
+            })
+            .collect();
+
+        if entries.is_empty() {
+            return;
+        }
+
+        let collection = &self.config.knowledge.default_collection;
+        match kb.store_results(collection, entries).await {
+            Ok(()) => {
+                tracing::info!(
+                    target: "agent",
+                    "Stored {} search results in knowledge base (collection: {})",
+                    result_array.len(),
+                    collection
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "agent",
+                    "Failed to store search results in knowledge base: {}",
+                    e
+                );
+            }
+        }
     }
 
     /// Update the system prompt dynamically.
