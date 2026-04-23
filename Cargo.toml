@@ -1,6 +1,6 @@
 [package]
 name = "cascade-agent"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Async LLM agentic engine with tool execution, memory management, and dynamic skills"
 license = "MIT"
@@ -10,7 +10,7 @@ categories = ["asynchronous", "command-line-utilities"]
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["full", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "fs", "net", "process", "macros", "io-util"] }
 futures = "0.3"
 async-trait = "0.1"
 
@@ -63,4 +63,12 @@ dirs = "6"
 
 [dev-dependencies]
 tempfile = "3"
-tokio-test = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+debug = "line-tables-only"
